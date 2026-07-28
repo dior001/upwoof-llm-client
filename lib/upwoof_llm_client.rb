@@ -14,7 +14,12 @@ module UpwoofLlmClient
   class TimeoutError < StandardError; end
   class LeaseUnavailable < StandardError; end
 
-  LEASE_KEY = "llm:gpu:lease".freeze
+  # Leases are per GPU: njord's RTX 3090 and odin's GTX 1080 contend for nothing with each other,
+  # so a single global key would make one card's work needlessly block the other's.
+  LEASE_KEY_PREFIX = "llm:gpu:lease".freeze
+  DEFAULT_GPU = "njord".freeze
+
+  def self.lease_key(gpu) = "#{LEASE_KEY_PREFIX}:#{gpu}"
 
   class Client
     # redis: any object speaking lpush/get (a Redis instance in production, a fake in specs).
@@ -71,22 +76,24 @@ module UpwoofLlmClient
     #
     # The block runs only once the GPU is exclusively ours; the lease is always released, and the
     # broker's queue worker refuses to launch models while it is held.
-    def with_gpu(holder:, ttl_s: 300, wait_s: 900, poll_interval_s: 2)
-      token = acquire_gpu(holder: holder, ttl_s: ttl_s, wait_s: wait_s, poll_interval_s: poll_interval_s)
+    def with_gpu(holder:, gpu: DEFAULT_GPU, ttl_s: 300, wait_s: 900, poll_interval_s: 2)
+      token = acquire_gpu(holder: holder, gpu: gpu, ttl_s: ttl_s, wait_s: wait_s,
+                          poll_interval_s: poll_interval_s)
       begin
         yield token
       ensure
-        release_gpu(token: token)
+        release_gpu(token: token, gpu: gpu)
       end
     end
 
-    def acquire_gpu(holder:, ttl_s: 300, wait_s: 900, poll_interval_s: 2)
+    def acquire_gpu(holder:, gpu: DEFAULT_GPU, ttl_s: 300, wait_s: 900, poll_interval_s: 2)
+      key = UpwoofLlmClient.lease_key(gpu)
       deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + wait_s
       loop do
         token = SecureRandom.uuid
         payload = JSON.generate(holder: holder, token: token,
                                 acquired_at: Time.now.utc.iso8601, ttl_s: ttl_s)
-        return token if @redis.set(LEASE_KEY, payload, nx: true, ex: ttl_s)
+        return token if @redis.set(key, payload, nx: true, ex: ttl_s)
         raise LeaseUnavailable, "GPU still busy after #{wait_s}s" if
           Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
 
@@ -96,24 +103,24 @@ module UpwoofLlmClient
 
     # Extends a held lease — call periodically from long jobs rather than taking a huge TTL, so a
     # crashed holder frees the GPU quickly. False means the lease is gone: stop using the GPU.
-    def heartbeat_gpu(token:, ttl_s: 300)
-      return false unless holding?(token)
+    def heartbeat_gpu(token:, gpu: DEFAULT_GPU, ttl_s: 300)
+      return false unless holding?(token, gpu)
 
-      @redis.expire(LEASE_KEY, ttl_s)
+      @redis.expire(UpwoofLlmClient.lease_key(gpu), ttl_s)
       true
     end
 
-    def release_gpu(token:)
-      return false unless holding?(token)
+    def release_gpu(token:, gpu: DEFAULT_GPU)
+      return false unless holding?(token, gpu)
 
-      @redis.del(LEASE_KEY)
+      @redis.del(UpwoofLlmClient.lease_key(gpu))
       true
     end
 
     private
 
-    def holding?(token)
-      raw = @redis.get(LEASE_KEY)
+    def holding?(token, gpu = DEFAULT_GPU)
+      raw = @redis.get(UpwoofLlmClient.lease_key(gpu))
       raw && JSON.parse(raw)["token"] == token
     rescue JSON::ParserError
       false

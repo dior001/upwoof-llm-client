@@ -24,7 +24,13 @@ PRIORITIES = {"interactive": INTERACTIVE_QUEUE, "batch": BATCH_QUEUE}
 DEFAULT_REDIS_URL = "redis://192.168.86.8:6390/0"
 
 
-LEASE_KEY = "llm:gpu:lease"
+# Leases are per GPU: njord's RTX 3090 and odin's GTX 1080 contend for nothing with each other.
+LEASE_KEY_PREFIX = "llm:gpu:lease"
+DEFAULT_GPU = "njord"
+
+
+def lease_key(gpu: str) -> str:
+    return f"{LEASE_KEY_PREFIX}:{gpu}"
 
 
 class BrokerTimeout(Exception):
@@ -80,17 +86,18 @@ class Client:
     # The broker's queue worker refuses to launch models while the lease is held.
 
     @contextlib.contextmanager
-    def gpu_lease(self, *, holder: str, ttl_s: int = 300, wait_s: int = 900,
-                  poll_interval_s: float = 2.0):
-        token = self.acquire_gpu(holder=holder, ttl_s=ttl_s, wait_s=wait_s,
+    def gpu_lease(self, *, holder: str, gpu: str = DEFAULT_GPU, ttl_s: int = 300,
+                  wait_s: int = 900, poll_interval_s: float = 2.0):
+        token = self.acquire_gpu(holder=holder, gpu=gpu, ttl_s=ttl_s, wait_s=wait_s,
                                  poll_interval_s=poll_interval_s)
         try:
             yield token
         finally:
-            self.release_gpu(token=token)
+            self.release_gpu(token=token, gpu=gpu)
 
-    def acquire_gpu(self, *, holder: str, ttl_s: int = 300, wait_s: int = 900,
-                    poll_interval_s: float = 2.0) -> str:
+    def acquire_gpu(self, *, holder: str, gpu: str = DEFAULT_GPU, ttl_s: int = 300,
+                    wait_s: int = 900, poll_interval_s: float = 2.0) -> str:
+        key = lease_key(gpu)
         deadline = time.monotonic() + wait_s
         while True:
             token = str(uuid.uuid4())
@@ -98,27 +105,27 @@ class Client:
                 "holder": holder, "token": token, "ttl_s": ttl_s,
                 "acquired_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             })
-            if self._redis.set(LEASE_KEY, payload, nx=True, ex=ttl_s):
+            if self._redis.set(key, payload, nx=True, ex=ttl_s):
                 return token
             if time.monotonic() > deadline:
                 raise LeaseUnavailable(f"GPU still busy after {wait_s}s")
             time.sleep(poll_interval_s)
 
-    def heartbeat_gpu(self, *, token: str, ttl_s: int = 300) -> bool:
+    def heartbeat_gpu(self, *, token: str, gpu: str = DEFAULT_GPU, ttl_s: int = 300) -> bool:
         """Extend a held lease. False means it is gone — stop using the GPU."""
-        if not self._holding(token):
+        if not self._holding(token, gpu):
             return False
-        self._redis.expire(LEASE_KEY, ttl_s)
+        self._redis.expire(lease_key(gpu), ttl_s)
         return True
 
-    def release_gpu(self, *, token: str) -> bool:
-        if not self._holding(token):
+    def release_gpu(self, *, token: str, gpu: str = DEFAULT_GPU) -> bool:
+        if not self._holding(token, gpu):
             return False
-        self._redis.delete(LEASE_KEY)
+        self._redis.delete(lease_key(gpu))
         return True
 
-    def _holding(self, token: str) -> bool:
-        raw = self._redis.get(LEASE_KEY)
+    def _holding(self, token: str, gpu: str = DEFAULT_GPU) -> bool:
+        raw = self._redis.get(lease_key(gpu))
         if not raw:
             return False
         try:

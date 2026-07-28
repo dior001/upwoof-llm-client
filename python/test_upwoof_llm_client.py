@@ -68,20 +68,20 @@ def test_await_result_returns_or_times_out(client, fake):
 
 
 def test_gpu_lease_holds_then_releases(client, fake):
-    from upwoof_llm_client import LEASE_KEY
+    from upwoof_llm_client import lease_key
 
     with client.gpu_lease(holder="hy3d"):
-        assert json.loads(fake.kv[LEASE_KEY])["holder"] == "hy3d"
-    assert LEASE_KEY not in fake.kv
+        assert json.loads(fake.kv[lease_key("njord")])["holder"] == "hy3d"
+    assert lease_key("njord") not in fake.kv
 
 
 def test_gpu_lease_releases_on_exception(client, fake):
-    from upwoof_llm_client import LEASE_KEY
+    from upwoof_llm_client import lease_key
 
     with pytest.raises(RuntimeError):
         with client.gpu_lease(holder="hy3d"):
             raise RuntimeError("generation failed")
-    assert LEASE_KEY not in fake.kv
+    assert lease_key("njord") not in fake.kv
 
 
 def test_acquire_gpu_gives_up_when_busy(client):
@@ -96,3 +96,12 @@ def test_release_and_heartbeat_reject_foreign_token(client):
     client.acquire_gpu(holder="pcsa-llm")
     assert client.release_gpu(token="not-mine") is False
     assert client.heartbeat_gpu(token="not-mine") is False
+
+
+def test_leases_are_scoped_per_gpu(client, fake):
+    from upwoof_llm_client import lease_key
+
+    client.acquire_gpu(holder="flux1", gpu="njord")
+    # odin's 1080 shares nothing with njord's 3090 -- musicgen must not be blocked.
+    assert client.acquire_gpu(holder="musicgen", gpu="odin", wait_s=0, poll_interval_s=0)
+    assert lease_key("odin") in fake.kv

@@ -64,16 +64,16 @@ RSpec.describe UpwoofLlmClient::Client do
   describe "GPU leases" do
     it "runs the block holding the lease and always releases it" do
       seen = nil
-      client.with_gpu(holder: "pcsa-llm") { |token| seen = redis.get(UpwoofLlmClient::LEASE_KEY) }
+      client.with_gpu(holder: "pcsa-llm") { |token| seen = redis.get(UpwoofLlmClient.lease_key("njord")) }
 
       expect(JSON.parse(seen)["holder"]).to eq("pcsa-llm")
-      expect(redis.get(UpwoofLlmClient::LEASE_KEY)).to be_nil
+      expect(redis.get(UpwoofLlmClient.lease_key("njord"))).to be_nil
     end
 
     it "releases the lease even when the block raises" do
       expect { client.with_gpu(holder: "pcsa-llm") { raise "analysis blew up" } }
         .to raise_error("analysis blew up")
-      expect(redis.get(UpwoofLlmClient::LEASE_KEY)).to be_nil
+      expect(redis.get(UpwoofLlmClient.lease_key("njord"))).to be_nil
     end
 
     it "gives up after wait_s when another holder will not release" do
@@ -86,6 +86,13 @@ RSpec.describe UpwoofLlmClient::Client do
       client.acquire_gpu(holder: "hy3d")
       expect(client.release_gpu(token: "not-mine")).to be false
       expect(client.heartbeat_gpu(token: "not-mine")).to be false
+    end
+
+    it "scopes leases per GPU so njord and odin never block each other" do
+      client.acquire_gpu(holder: "flux1", gpu: "njord")
+      expect(client.acquire_gpu(holder: "musicgen", gpu: "odin", wait_s: 0, poll_interval_s: 0))
+        .to be_a(String)
+      expect(redis.get(UpwoofLlmClient.lease_key("odin"))).to be_truthy
     end
   end
 end
