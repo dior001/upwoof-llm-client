@@ -16,6 +16,18 @@ class FakeRedis:
     def get(self, key):
         return self.kv.get(key)
 
+    def set(self, key, val, nx=False, ex=None):
+        if nx and key in self.kv:
+            return False
+        self.kv[key] = val
+        return True
+
+    def delete(self, key):
+        return self.kv.pop(key, None) is not None
+
+    def expire(self, key, _ttl):
+        return key in self.kv
+
 
 @pytest.fixture
 def fake():
@@ -53,3 +65,34 @@ def test_await_result_returns_or_times_out(client, fake):
     assert client.await_result("abc", timeout_s=1, poll_interval_s=0) == {"status": "ok"}
     with pytest.raises(BrokerTimeout):
         client.await_result("never", timeout_s=0, poll_interval_s=0)
+
+
+def test_gpu_lease_holds_then_releases(client, fake):
+    from upwoof_llm_client import LEASE_KEY
+
+    with client.gpu_lease(holder="hy3d"):
+        assert json.loads(fake.kv[LEASE_KEY])["holder"] == "hy3d"
+    assert LEASE_KEY not in fake.kv
+
+
+def test_gpu_lease_releases_on_exception(client, fake):
+    from upwoof_llm_client import LEASE_KEY
+
+    with pytest.raises(RuntimeError):
+        with client.gpu_lease(holder="hy3d"):
+            raise RuntimeError("generation failed")
+    assert LEASE_KEY not in fake.kv
+
+
+def test_acquire_gpu_gives_up_when_busy(client):
+    from upwoof_llm_client import LeaseUnavailable
+
+    client.acquire_gpu(holder="pcsa-llm")
+    with pytest.raises(LeaseUnavailable):
+        client.acquire_gpu(holder="hy3d", wait_s=0, poll_interval_s=0)
+
+
+def test_release_and_heartbeat_reject_foreign_token(client):
+    client.acquire_gpu(holder="pcsa-llm")
+    assert client.release_gpu(token="not-mine") is False
+    assert client.heartbeat_gpu(token="not-mine") is False

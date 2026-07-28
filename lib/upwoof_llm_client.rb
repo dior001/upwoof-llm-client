@@ -1,5 +1,6 @@
 require "json"
 require "securerandom"
+require "time"
 
 # Client for the upwoof-gpu-broker queue (see that repo's README for the wire format). Deliberately
 # tiny: enqueue a job onto the broker's Redis, poll for its result key. No retries, no callbacks —
@@ -11,6 +12,9 @@ module UpwoofLlmClient
   PRIORITIES = { interactive: INTERACTIVE_QUEUE, batch: BATCH_QUEUE }.freeze
 
   class TimeoutError < StandardError; end
+  class LeaseUnavailable < StandardError; end
+
+  LEASE_KEY = "llm:gpu:lease".freeze
 
   class Client
     # redis: any object speaking lpush/get (a Redis instance in production, a fake in specs).
@@ -54,6 +58,65 @@ module UpwoofLlmClient
     def call(model:, payload:, priority: :interactive, timeout_s: 600)
       id = enqueue(model: model, payload: payload, priority: priority, timeout_s: timeout_s)
       await(id, timeout_s: timeout_s + 60)
+    end
+
+    # --- GPU leases (for services the broker must not launch) ------------------------------
+    #
+    # A service that manages its own model lifecycle (pcsa-llm terminates its model child process
+    # to reclaim 100% of VRAM; hy3d is exec'd into) does not want to become a broker-launched
+    # container — it would lose live progress reporting and large-upload handling. What it needs
+    # is the one thing it cannot do alone: mutual exclusion against every other GPU workload.
+    #
+    #   client.with_gpu(holder: "pcsa-llm") { run_the_analysis }
+    #
+    # The block runs only once the GPU is exclusively ours; the lease is always released, and the
+    # broker's queue worker refuses to launch models while it is held.
+    def with_gpu(holder:, ttl_s: 300, wait_s: 900, poll_interval_s: 2)
+      token = acquire_gpu(holder: holder, ttl_s: ttl_s, wait_s: wait_s, poll_interval_s: poll_interval_s)
+      begin
+        yield token
+      ensure
+        release_gpu(token: token)
+      end
+    end
+
+    def acquire_gpu(holder:, ttl_s: 300, wait_s: 900, poll_interval_s: 2)
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + wait_s
+      loop do
+        token = SecureRandom.uuid
+        payload = JSON.generate(holder: holder, token: token,
+                                acquired_at: Time.now.utc.iso8601, ttl_s: ttl_s)
+        return token if @redis.set(LEASE_KEY, payload, nx: true, ex: ttl_s)
+        raise LeaseUnavailable, "GPU still busy after #{wait_s}s" if
+          Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+
+        sleep poll_interval_s
+      end
+    end
+
+    # Extends a held lease — call periodically from long jobs rather than taking a huge TTL, so a
+    # crashed holder frees the GPU quickly. False means the lease is gone: stop using the GPU.
+    def heartbeat_gpu(token:, ttl_s: 300)
+      return false unless holding?(token)
+
+      @redis.expire(LEASE_KEY, ttl_s)
+      true
+    end
+
+    def release_gpu(token:)
+      return false unless holding?(token)
+
+      @redis.del(LEASE_KEY)
+      true
+    end
+
+    private
+
+    def holding?(token)
+      raw = @redis.get(LEASE_KEY)
+      raw && JSON.parse(raw)["token"] == token
+    rescue JSON::ParserError
+      false
     end
   end
 end
