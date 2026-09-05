@@ -1,0 +1,20 @@
+# Dependency updates for this repo.
+#
+# PRs raised here are picked up automatically by `dependabot-orchestrator`, which clones the
+# branch, runs the test suite in an isolated container, and merges on green. Without this file
+# the repo raises no PRs at all, so the orchestrator never sees it -- it looks healthy while its
+# dependencies rot.
+#
+# Minor and patch updates are grouped per ecosystem to keep test runs proportionate; majors stay
+# separate so a breaking change is reviewed on its own.
+
+version: 2
+updates:
+  - package-ecosystem: "bundler"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    groups:
+      minor-and-patch:
+        update-types: ["minor", "patch"]
